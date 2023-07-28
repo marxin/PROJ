@@ -74,6 +74,12 @@ using namespace NS_PROJ::internal;
 
 NS_PROJ_START
 
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <cstdio>
+#include <cstdlib>
+
 // ---------------------------------------------------------------------------
 
 File::File(const std::string &filename) : name_(filename) {}
@@ -802,6 +808,59 @@ std::unique_ptr<File> FileStdio::open(PJ_CONTEXT *ctx, const char *filename,
 #endif // _WIN32
 
 // ---------------------------------------------------------------------------
+
+class FileMmaped : public File {
+    PJ_CONTEXT *m_ctx;
+    void *addr;
+    size_t offset = 0;
+    size_t size;
+
+    FileMmaped(const FileStdio &) = delete;
+    FileMmaped &operator=(const FileStdio &) = delete;
+
+  public:
+  FileMmaped(const std::string &filename, void *_addr, size_t _size)
+        : File(filename), addr(_addr), size(_size) {}
+  ~FileMmaped() override {
+        fprintf(stderr, "munmapped %s\n", name_.c_str());
+        munmap(addr, size);
+  }
+
+  size_t read(void *buffer, size_t sizeBytes) override
+  {
+        memcpy(buffer, addr + offset, sizeBytes);
+        return sizeBytes;
+      }
+
+      size_t write(const void *, size_t) override { return -1; }
+      bool seek(unsigned long long offset, int whence = SEEK_SET) override
+      {
+        if(whence != SEEK_SET)
+            throw std::runtime_error("unexpected seek argument!");
+        this->offset = offset;
+        return true; // success
+      }
+      unsigned long long tell() override
+      {
+        return this->offset;
+      }
+      void reassign_context(PJ_CONTEXT *ctx) override { m_ctx = ctx; }
+
+      // We may lie, but the real use case is only for network files
+      bool hasChanged() const override { return false; }
+
+      static std::unique_ptr<File> open(PJ_CONTEXT *ctx, const char *filename,
+                                        FileAccess access)
+      {
+        int fd = __open_alias(filename, O_RDONLY);
+        struct stat sb;
+        fstat(fd, &sb);
+        fprintf(stderr, "will mmap %s with %ld B\n", filename, sb.st_size);
+        void *addr = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+
+        return std::unique_ptr<FileMmaped>(new FileMmaped(filename, addr, sb.st_size));
+    }
+};
 
 class FileApiAdapter : public File {
     PJ_CONTEXT *m_ctx;
@@ -1634,6 +1693,12 @@ NS_PROJ::FileManager::open_resource_file(PJ_CONTEXT *ctx, const char *name) {
 
     if (ctx == nullptr) {
         ctx = pj_get_default_ctx();
+    }
+
+    if (strcmp (name, "egm2008_west_europe.gtx") == 0)
+    {
+        // XXXXX
+        return FileMmaped::open(ctx, "/home/melown/Programming/vadstena/vadstena/build/share/proj/egm2008_west_europe.gtx", NS_PROJ::FileAccess::READ_ONLY);
     }
 
     auto file = std::unique_ptr<NS_PROJ::File>(
